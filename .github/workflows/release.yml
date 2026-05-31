@@ -1,0 +1,99 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build ${{ matrix.artifact_suffix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact_suffix: linux-x64-musl
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_suffix: windows-x64-msvc
+            archive_ext: zip
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: Install system dependencies for cargo tests and musl builds
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo apt-get update && sudo apt-get install -y ripgrep musl-tools
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            choco install ripgrep -y
+          fi
+
+      - name: Validate
+        shell: bash
+        run: |
+          cargo fmt --check
+          cargo test
+          cargo clippy --target ${{ matrix.target }} -- -D warnings
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Linux artifact
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$VERSION" == "$GITHUB_REF_NAME" ]]; then
+            VERSION="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -n1)"
+          fi
+          ARTIFACT_DIR="fast-context-rust-${VERSION}-${{ matrix.artifact_suffix }}"
+          mkdir -p "dist/${ARTIFACT_DIR}"
+          cp "target/${{ matrix.target }}/release/fast-context-rust" "dist/${ARTIFACT_DIR}/"
+          cp README.md "dist/${ARTIFACT_DIR}/"
+          tar -C dist -czf "dist/${ARTIFACT_DIR}.tar.gz" "${ARTIFACT_DIR}"
+          shasum -a 256 "dist/${ARTIFACT_DIR}.tar.gz" > "dist/${ARTIFACT_DIR}.tar.gz.sha256"
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Version = "${{ github.ref_name }}"
+          if ($Version.StartsWith("v")) {
+            $Version = $Version.Substring(1)
+          } else {
+            $Metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+            $Version = $Metadata.packages[0].version
+          }
+          $ArtifactDir = "fast-context-rust-$Version-${{ matrix.artifact_suffix }}"
+          New-Item -ItemType Directory -Force "dist/$ArtifactDir" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/fast-context-rust.exe" "dist/$ArtifactDir/"
+          Copy-Item "README.md" "dist/$ArtifactDir/"
+          7z a "dist/$ArtifactDir.zip" "./dist/$ArtifactDir/*"
+          $Hash = (Get-FileHash "dist/$ArtifactDir.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$Hash  $ArtifactDir.zip" | Set-Content -NoNewline "dist/$ArtifactDir.zip.sha256"
+
+      - uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          generate_release_notes: true
